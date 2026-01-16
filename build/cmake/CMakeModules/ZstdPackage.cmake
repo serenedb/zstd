@@ -2,6 +2,10 @@
 # ZSTD Package Configuration
 # ################################################################
 
+if(NOT ZSTD_INSTALL)
+    return()
+endif()
+
 include(CMakePackageConfigHelpers)
 
 # Generate version file
