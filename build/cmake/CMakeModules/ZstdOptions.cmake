@@ -64,5 +64,8 @@ if(ZSTD_ENABLE_CXX)
     enable_language(CXX)
 endif()
 
+# Install option
+option(ZSTD_INSTALL "Enable install targets" ON)
+
 # Set global definitions
 add_definitions(-DXXH_NAMESPACE=ZSTD_)
