@@ -798,6 +798,129 @@ typedef struct {
     size_t prevOffset[ZSTD_REP_NUM];
 } seqState_t;
 
+
+#if defined(ZSTD_ARCH_ARM_NEON) || defined(ZSTD_ARCH_X86_SSSE3)
+#  define ZSTD_HAS_SHORT_OFFSET_COPY 1
+/* ZSTD_shortOffsetCopy() :
+ *  Copies a match with offset < 16 without branching on the offset.
+ *  The 16 bytes before op are already written; one table lookup (NEON `tbl` / SSSE3 `pshufb`)
+ *  expands the period of `offset` bytes to 16 output bytes, and each further lookup advances the
+ *  pattern by 16 (by 32 with AVX2). All indices are < 16, so they stay in range.
+ *  Precondition: 1 <= offset < 16, op - 16 is readable, and op + matchLength + 32 is writable:
+ *  the loop stores up to 31 bytes past op + matchLength with AVX2, 15 otherwise. */
+static const BYTE ZSTD_shortOffsetStart[16][16] = {
+    { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+    {15,15,15,15,15,15,15,15,15,15,15,15,15,15,15,15},
+    {14,15,14,15,14,15,14,15,14,15,14,15,14,15,14,15},
+    {13,14,15,13,14,15,13,14,15,13,14,15,13,14,15,13},
+    {12,13,14,15,12,13,14,15,12,13,14,15,12,13,14,15},
+    {11,12,13,14,15,11,12,13,14,15,11,12,13,14,15,11},
+    {10,11,12,13,14,15,10,11,12,13,14,15,10,11,12,13},
+    { 9,10,11,12,13,14,15, 9,10,11,12,13,14,15, 9,10},
+    { 8, 9,10,11,12,13,14,15, 8, 9,10,11,12,13,14,15},
+    { 7, 8, 9,10,11,12,13,14,15, 7, 8, 9,10,11,12,13},
+    { 6, 7, 8, 9,10,11,12,13,14,15, 6, 7, 8, 9,10,11},
+    { 5, 6, 7, 8, 9,10,11,12,13,14,15, 5, 6, 7, 8, 9},
+    { 4, 5, 6, 7, 8, 9,10,11,12,13,14,15, 4, 5, 6, 7},
+    { 3, 4, 5, 6, 7, 8, 9,10,11,12,13,14,15, 3, 4, 5},
+    { 2, 3, 4, 5, 6, 7, 8, 9,10,11,12,13,14,15, 2, 3},
+    { 1, 2, 3, 4, 5, 6, 7, 8, 9,10,11,12,13,14,15, 1}
+};
+static const BYTE ZSTD_shortOffsetAdvance[16][16] = {
+    { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+    { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+    { 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1},
+    { 1, 2, 0, 1, 2, 0, 1, 2, 0, 1, 2, 0, 1, 2, 0, 1},
+    { 0, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3},
+    { 1, 2, 3, 4, 0, 1, 2, 3, 4, 0, 1, 2, 3, 4, 0, 1},
+    { 4, 5, 0, 1, 2, 3, 4, 5, 0, 1, 2, 3, 4, 5, 0, 1},
+    { 2, 3, 4, 5, 6, 0, 1, 2, 3, 4, 5, 6, 0, 1, 2, 3},
+    { 0, 1, 2, 3, 4, 5, 6, 7, 0, 1, 2, 3, 4, 5, 6, 7},
+    { 7, 8, 0, 1, 2, 3, 4, 5, 6, 7, 8, 0, 1, 2, 3, 4},
+    { 6, 7, 8, 9, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 0, 1},
+    { 5, 6, 7, 8, 9,10, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9},
+    { 4, 5, 6, 7, 8, 9,10,11, 0, 1, 2, 3, 4, 5, 6, 7},
+    { 3, 4, 5, 6, 7, 8, 9,10,11,12, 0, 1, 2, 3, 4, 5},
+    { 2, 3, 4, 5, 6, 7, 8, 9,10,11,12,13, 0, 1, 2, 3},
+    { 1, 2, 3, 4, 5, 6, 7, 8, 9,10,11,12,13,14, 0, 1}
+};
+#if defined(ZSTD_ARCH_X86_AVX2)
+/* (32 + j) % offset: `vpshufb` shuffles each 128-bit lane separately, and the two lanes hold the
+ * pattern at positions 0..15 and 16..31. The period is at most 16, so this index vector advances
+ * both lanes by 32 bytes. */
+static const BYTE ZSTD_shortOffsetAdvance32[16][16] = {
+    { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+    { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+    { 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1},
+    { 2, 0, 1, 2, 0, 1, 2, 0, 1, 2, 0, 1, 2, 0, 1, 2},
+    { 0, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3},
+    { 2, 3, 4, 0, 1, 2, 3, 4, 0, 1, 2, 3, 4, 0, 1, 2},
+    { 2, 3, 4, 5, 0, 1, 2, 3, 4, 5, 0, 1, 2, 3, 4, 5},
+    { 4, 5, 6, 0, 1, 2, 3, 4, 5, 6, 0, 1, 2, 3, 4, 5},
+    { 0, 1, 2, 3, 4, 5, 6, 7, 0, 1, 2, 3, 4, 5, 6, 7},
+    { 5, 6, 7, 8, 0, 1, 2, 3, 4, 5, 6, 7, 8, 0, 1, 2},
+    { 2, 3, 4, 5, 6, 7, 8, 9, 0, 1, 2, 3, 4, 5, 6, 7},
+    {10, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9,10, 0, 1, 2, 3},
+    { 8, 9,10,11, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9,10,11},
+    { 6, 7, 8, 9,10,11,12, 0, 1, 2, 3, 4, 5, 6, 7, 8},
+    { 4, 5, 6, 7, 8, 9,10,11,12,13, 0, 1, 2, 3, 4, 5},
+    { 2, 3, 4, 5, 6, 7, 8, 9,10,11,12,13,14, 0, 1, 2}
+};
+#endif
+HINT_INLINE void ZSTD_shortOffsetCopy(BYTE* op, size_t offset, size_t matchLength)
+{
+    BYTE* const oend = op + matchLength;
+    assert(offset >= 1 && offset < 16);
+#if defined(ZSTD_ARCH_ARM_NEON)
+    {   uint8x16_t pattern = vqtbl1q_u8(vld1q_u8(op - 16), vld1q_u8(ZSTD_shortOffsetStart[offset]));
+        uint8x16_t const advance = vld1q_u8(ZSTD_shortOffsetAdvance[offset]);
+        vst1q_u8(op, pattern);
+        pattern = vqtbl1q_u8(pattern, advance);
+        vst1q_u8(op + 16, pattern);
+        op += 32;
+        while (op < oend) {
+            pattern = vqtbl1q_u8(pattern, advance);
+            vst1q_u8(op, pattern);
+            op += 16;
+        }
+    }
+#elif defined(ZSTD_ARCH_X86_AVX2)
+    /* The casts go through `void*` because the loads and stores are unaligned,
+     * and a direct `BYTE*` -> `__m128i*` cast trips -Wcast-align. */
+    {   __m128i const p0 = _mm_shuffle_epi8(_mm_loadu_si128((const __m128i*)(const void*)(op - 16)),
+                                            _mm_loadu_si128((const __m128i*)(const void*)ZSTD_shortOffsetStart[offset]));
+        __m128i const p1 = _mm_shuffle_epi8(p0, _mm_loadu_si128((const __m128i*)(const void*)ZSTD_shortOffsetAdvance[offset]));
+        __m256i pattern = _mm256_set_m128i(p1, p0);
+        __m256i const advance = _mm256_broadcastsi128_si256(
+            _mm_loadu_si128((const __m128i*)(const void*)ZSTD_shortOffsetAdvance32[offset]));
+        _mm256_storeu_si256((__m256i*)(void*)op, pattern);
+        op += 32;
+        while (op < oend) {
+            pattern = _mm256_shuffle_epi8(pattern, advance);
+            _mm256_storeu_si256((__m256i*)(void*)op, pattern);
+            op += 32;
+        }
+    }
+#else
+    /* The casts go through `void*` because the loads and stores are unaligned,
+     * and a direct `BYTE*` -> `__m128i*` cast trips -Wcast-align. */
+    {   __m128i pattern = _mm_shuffle_epi8(_mm_loadu_si128((const __m128i*)(const void*)(op - 16)),
+                                           _mm_loadu_si128((const __m128i*)(const void*)ZSTD_shortOffsetStart[offset]));
+        __m128i const advance = _mm_loadu_si128((const __m128i*)(const void*)ZSTD_shortOffsetAdvance[offset]);
+        _mm_storeu_si128((__m128i*)(void*)op, pattern);
+        pattern = _mm_shuffle_epi8(pattern, advance);
+        _mm_storeu_si128((__m128i*)(void*)(op + 16), pattern);
+        op += 32;
+        while (op < oend) {
+            pattern = _mm_shuffle_epi8(pattern, advance);
+            _mm_storeu_si128((__m128i*)(void*)op, pattern);
+            op += 16;
+        }
+    }
+#endif
+}
+#endif
+
 /*! ZSTD_overlapCopy8() :
  *  Copies 8 bytes from ip to op and updates op and ip where ip <= op.
  *  If the offset is < 8 then the offset is spread to at least 8 bytes.
@@ -1106,6 +1229,14 @@ size_t ZSTD_execSequence(BYTE* op,
     }
     assert(offset < WILDCOPY_VECLEN);
 
+#if defined(ZSTD_HAS_SHORT_OFFSET_COPY)
+    /* oMatchEnd <= oend_w leaves 32 bytes of slack for the over-write. */
+    if (LIKELY(op - prefixStart >= 16)) {
+        ZSTD_shortOffsetCopy(op, offset, matchLength);
+        return sequenceLength;
+    }
+#endif
+
     /* Copy 8 bytes and spread the offset to be >= 8. */
     ZSTD_overlapCopy8(&op, &match, offset);
 
@@ -1202,6 +1333,14 @@ size_t ZSTD_execSequenceSplitLitBuffer(BYTE* op,
         return sequenceLength;
     }
     assert(offset < WILDCOPY_VECLEN);
+
+#if defined(ZSTD_HAS_SHORT_OFFSET_COPY)
+    /* oMatchEnd <= oend_w leaves 32 bytes of slack for the over-write. */
+    if (LIKELY(op - prefixStart >= 16)) {
+        ZSTD_shortOffsetCopy(op, offset, matchLength);
+        return sequenceLength;
+    }
+#endif
 
     /* Copy 8 bytes and spread the offset to be >= 8. */
     ZSTD_overlapCopy8(&op, &match, offset);
