@@ -224,9 +224,43 @@ void ZSTD_wildcopy(void* dst, const void* src, size_t length, ZSTD_overlap_e con
 
     if (ovtype == ZSTD_overlap_src_before_dst && diff < WILDCOPY_VECLEN) {
         /* Handle short offset copies. */
+#if defined(ZSTD_ARCH_X86_SSSE3)
+        static const BYTE adv[16][16] = {
+            { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+            { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+            { 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1},
+            { 1, 2, 0, 1, 2, 0, 1, 2, 0, 1, 2, 0, 1, 2, 0, 1},
+            { 0, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3},
+            { 1, 2, 3, 4, 0, 1, 2, 3, 4, 0, 1, 2, 3, 4, 0, 1},
+            { 4, 5, 0, 1, 2, 3, 4, 5, 0, 1, 2, 3, 4, 5, 0, 1},
+            { 2, 3, 4, 5, 6, 0, 1, 2, 3, 4, 5, 6, 0, 1, 2, 3},
+            { 0, 1, 2, 3, 4, 5, 6, 7, 0, 1, 2, 3, 4, 5, 6, 7},
+            { 7, 8, 0, 1, 2, 3, 4, 5, 6, 7, 8, 0, 1, 2, 3, 4},
+            { 6, 7, 8, 9, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 0, 1},
+            { 5, 6, 7, 8, 9,10, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9},
+            { 4, 5, 6, 7, 8, 9,10,11, 0, 1, 2, 3, 4, 5, 6, 7},
+            { 3, 4, 5, 6, 7, 8, 9,10,11,12, 0, 1, 2, 3, 4, 5},
+            { 2, 3, 4, 5, 6, 7, 8, 9,10,11,12,13, 0, 1, 2, 3},
+            { 1, 2, 3, 4, 5, 6, 7, 8, 9,10,11,12,13,14, 0, 1},
+        };
+        __m128i pattern;
+        __m128i advance;
+        ZSTD_STATIC_ASSERT(WILDCOPY_VECLEN - 1 <= WILDCOPY_OVERLENGTH);
+        assert(diff >= 8);
+        COPY8(op, ip);
+        COPY8(op, ip);
+        pattern = _mm_loadu_si128((const __m128i*)(const void*)(op - 16));
+        advance = _mm_loadu_si128((const __m128i*)(const void*)adv[diff]);
+        while (op < oend) {
+            pattern = _mm_shuffle_epi8(pattern, advance);
+            _mm_storeu_si128((__m128i*)(void*)op, pattern);
+            op += 16;
+        }
+#else
         do {
             COPY8(op, ip);
         } while (op < oend);
+#endif
     } else {
         assert(diff >= WILDCOPY_VECLEN || diff <= -WILDCOPY_VECLEN);
         /* Separate out the first COPY16() call because the copy length is
